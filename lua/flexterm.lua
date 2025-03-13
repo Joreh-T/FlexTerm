@@ -1,79 +1,108 @@
--- lua/flexterm/init.lua（修改后）
+-- lua/flexterm/init.lua
 local M = {}
-local config = {}
-local terminals = {}
+local terminals = {}  -- 存储所有终端实例
 
-local default_config = {
-  split_mode = "vsplit", -- 支持 "vsplit"（垂直）或 "hsplit"（水平）
-  split_ratio = 0.5,     -- 分割比例
-  dynamic_layout = true  -- 自动根据侧边栏调整
+local config = {
+  position = "bottom", -- "bottom" | "right" | "float"
+  size = 15,
+  shell = vim.o.shell,
+  filetype = "flexterm",  -- 用于隐藏 bufferline
+  start_insert = true,
+  auto_close = true,
+  hide_bufferline = true
 }
 
-local function get_main_area()
-  local has_sidebar = false
-  local sidebar_width = 0
-  for _, win in ipairs(vim.api.nvim_list_wins()) do
-    local buf = vim.api.nvim_win_get_buf(win)
-    if vim.bo[buf].filetype == "neo-tree" then
-      has_sidebar = true
-      sidebar_width = vim.api.nvim_win_get_width(win)
+---@class Terminal
+---@field buf integer
+---@field win integer
+---@field job_id integer
+---@field cmd string|string[]
+
+local function generate_term_id(cmd, cwd)
+  return table.concat({
+    type(cmd) == "table" and table.concat(cmd, " ") or cmd,
+    cwd or vim.loop.cwd()
+  }, "|")
+end
+
+function M.toggle(cmd, opts)
+  opts = opts or {}
+  cmd = cmd or config.shell
+  local term_id = generate_term_id(cmd, opts.cwd)
+
+  -- 复用现有终端
+  if terminals[term_id] and vim.api.nvim_win_is_valid(terminals[term_id].win) then
+    local term = terminals[term_id]
+    if vim.api.nvim_win_get_config(term.win).relative ~= "" then
+      vim.api.nvim_win_hide(term.win)  -- 浮动窗口隐藏
+    else
+      vim.api.nvim_win_close(term.win, true)  -- 分屏窗口关闭
     end
+    terminals[term_id] = nil
+    return
   end
 
-  return {
-    has_sidebar = has_sidebar,
-    sidebar_width = sidebar_width,
-    main_width = vim.o.columns - sidebar_width,
-    main_height = vim.o.lines - 2 -- 减去状态栏和命令行高度
+  -- 创建新终端
+  local buf = vim.api.nvim_create_buf(false, true)
+  local win_opts = {
+    style = "minimal",
+    relative = "editor",
+    width = vim.o.columns,
+    height = config.size,
+    row = vim.o.lines - config.size - 1,
+    col = 0
   }
-end
 
-function M.create_terminal()
-  local area = get_main_area()
-  
-  -- Step 1: 创建右侧主窗口（如果不存在）
-  if not terminals.main_win then
-    vim.cmd("wincmd l") -- 移动到右侧
-    terminals.main_win = vim.api.nvim_get_current_win()
+  local win = vim.api.nvim_open_win(buf, true, win_opts)
+  local job_id = vim.fn.termopen(cmd, {
+    cwd = opts.cwd,
+    env = opts.env,
+    on_exit = function(_, code)
+      if code ~= 0 and config.auto_close then
+        M.toggle(cmd, opts)  -- 自动关闭异常终端
+      end
+    end
+  })
+
+  -- 配置终端特性
+  vim.bo[buf].filetype = config.filetype
+  if config.start_insert then
+    vim.cmd.startinsert()
   end
 
-  -- Step 2: 在右侧主窗口内水平分割
-  vim.api.nvim_set_current_win(terminals.main_win)
-  vim.cmd("split term://"..config.shell)
-  
-  -- Step 3: 调整分割比例
-  local term_win = vim.api.nvim_get_current_win()
-  vim.api.nvim_win_set_height(term_win, math.floor(area.main_height * (1 - config.split_ratio)))
-  
-  -- Step 4: 返回上层窗口（文本编辑区）
-  vim.cmd("wincmd k")
-  terminals.text_win = vim.api.nvim_get_current_win()
+  -- 记录终端实例
+  terminals[term_id] = {
+    buf = buf,
+    win = win,
+    job_id = job_id,
+    cmd = cmd
+  }
 
-  return term_win
-end
+  -- 配置双 ESC 退出
+  vim.keymap.set("t", "<Esc>", function()
+    local timer = vim.loop.new_timer()
+    timer:start(200, 0, function()
+      timer:close()
+      vim.schedule(function()
+        vim.cmd.stopinsert()
+      end)
+    end)
+    return "<Esc>"
+  end, { buffer = buf, expr = true })
 
-function M.toggle()
-  if terminals.term_win and vim.api.nvim_win_is_valid(terminals.term_win) then
-    vim.api.nvim_win_close(terminals.term_win, true)
-    terminals.term_win = nil
-  else
-    terminals.term_win = M.create_terminal()
-  end
+  -- 自动定位焦点
+  vim.api.nvim_set_current_win(win)
 end
 
 function M.setup(user_config)
-  config = vim.tbl_deep_extend("force", default_config, user_config or {})
+  config = vim.tbl_deep_extend("force", config, user_config or {})
 
-  -- 自动布局调整
-  if config.dynamic_layout then
-    vim.api.nvim_create_autocmd({"WinResized", "BufEnter"}, {
-      callback = function()
-        if terminals.term_win and vim.api.nvim_win_is_valid(terminals.term_win) then
-          local area = get_main_area()
-          vim.api.nvim_win_set_width(terminals.main_win, area.main_width)
-          vim.api.nvim_win_set_height(terminals.term_win, 
-            math.floor(area.main_height * (1 - config.split_ratio)))
-        end
+  -- 隐藏 bufferline
+  if config.hide_bufferline then
+    vim.api.nvim_create_autocmd("FileType", {
+      pattern = config.filetype,
+      callback = function(args)
+        vim.bo[args.buf].buflisted = false
       end
     })
   end
